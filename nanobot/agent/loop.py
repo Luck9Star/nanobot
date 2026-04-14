@@ -28,6 +28,7 @@ from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.search import GlobTool, GrepTool
 from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.spawn import SpawnTool
+from nanobot.agent.tools.python_runtime import PythonRuntimeTool
 from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.command import CommandContext, CommandRouter, register_builtin_commands
@@ -39,7 +40,12 @@ from nanobot.utils.helpers import image_placeholder_text, truncate_text as trunc
 from nanobot.utils.runtime import EMPTY_FINAL_RESPONSE_MESSAGE
 
 if TYPE_CHECKING:
-    from nanobot.config.schema import ChannelsConfig, ExecToolConfig, WebToolsConfig
+    from nanobot.config.schema import (
+        ChannelsConfig,
+        ExecToolConfig,
+        PythonRuntimeConfig,
+        WebToolsConfig,
+    )
     from nanobot.cron.service import CronService
 
 
@@ -144,6 +150,7 @@ class AgentLoop:
         provider_retry_mode: str = "standard",
         web_config: WebToolsConfig | None = None,
         exec_config: ExecToolConfig | None = None,
+        python_runtime_config: PythonRuntimeConfig | None = None,
         cron_service: CronService | None = None,
         restrict_to_workspace: bool = False,
         session_manager: SessionManager | None = None,
@@ -155,7 +162,7 @@ class AgentLoop:
         unified_session: bool = False,
         disabled_skills: list[str] | None = None,
     ):
-        from nanobot.config.schema import ExecToolConfig, WebToolsConfig
+        from nanobot.config.schema import ExecToolConfig, PythonRuntimeConfig, WebToolsConfig
 
         defaults = AgentDefaults()
         self.bus = bus
@@ -180,6 +187,8 @@ class AgentLoop:
         self.provider_retry_mode = provider_retry_mode
         self.web_config = web_config or WebToolsConfig()
         self.exec_config = exec_config or ExecToolConfig()
+        self.python_runtime_config = python_runtime_config or PythonRuntimeConfig()
+        self._python_runtime_tool: PythonRuntimeTool | None = None
         self.cron_service = cron_service
         self.restrict_to_workspace = restrict_to_workspace
         self._start_time = time.time()
@@ -281,6 +290,22 @@ class AgentLoop:
             self.tools.register(
                 CronTool(self.cron_service, default_timezone=self.context.timezone or "UTC")
             )
+        if self.python_runtime_config.enable:
+            try:
+                python_tool = PythonRuntimeTool(
+                    backend=self.python_runtime_config.backend,
+                    max_output_chars=self.python_runtime_config.max_output_chars,
+                )
+                self.tools.register(python_tool)
+                self._python_runtime_tool = python_tool
+                logger.info(
+                    "PythonRuntimeTool registered (backend={})", self.python_runtime_config.backend
+                )
+            except ImportError:
+                logger.warning(
+                    "PythonRuntimeTool enabled but cave-agent not installed. "
+                    "Install with: pip install 'cave-agent[all]'"
+                )
 
     async def _connect_mcp(self) -> None:
         """Connect to configured MCP servers (one-time, lazy)."""
@@ -310,6 +335,13 @@ class AgentLoop:
             if tool := self.tools.get(name):
                 if hasattr(tool, "set_context"):
                     tool.set_context(channel, chat_id, *([message_id] if name == "message" else []))
+
+    def _python_namespace_description(self) -> str | None:
+        """Return the Python runtime namespace description for system prompt injection."""
+        if self._python_runtime_tool is None:
+            return None
+        desc = self._python_runtime_tool.describe_namespace()
+        return desc if desc and desc != "Empty namespace" else None
 
     @staticmethod
     def _strip_think(text: str | None) -> str | None:
@@ -399,30 +431,38 @@ class AgentLoop:
                 items.append({"role": "user", "content": merged})
             return items
 
-        result = await self.runner.run(AgentRunSpec(
-            initial_messages=initial_messages,
-            tools=self.tools,
-            model=self.model,
-            max_iterations=self.max_iterations,
-            max_tool_result_chars=self.max_tool_result_chars,
-            hook=hook,
-            error_message="Sorry, I encountered an error calling the AI model.",
-            concurrent_tools=True,
-            workspace=self.workspace,
-            session_key=session.key if session else None,
-            context_window_tokens=self.context_window_tokens,
-            context_block_limit=self.context_block_limit,
-            provider_retry_mode=self.provider_retry_mode,
-            progress_callback=on_progress,
-            checkpoint_callback=_checkpoint,
-            injection_callback=_drain_pending,
-        ))
+        result = await self.runner.run(
+            AgentRunSpec(
+                initial_messages=initial_messages,
+                tools=self.tools,
+                model=self.model,
+                max_iterations=self.max_iterations,
+                max_tool_result_chars=self.max_tool_result_chars,
+                hook=hook,
+                error_message="Sorry, I encountered an error calling the AI model.",
+                concurrent_tools=True,
+                workspace=self.workspace,
+                session_key=session.key if session else None,
+                context_window_tokens=self.context_window_tokens,
+                context_block_limit=self.context_block_limit,
+                provider_retry_mode=self.provider_retry_mode,
+                progress_callback=on_progress,
+                checkpoint_callback=_checkpoint,
+                injection_callback=_drain_pending,
+            )
+        )
         self._last_usage = result.usage
         if result.stop_reason == "max_iterations":
             logger.warning("Max iterations ({}) reached", self.max_iterations)
         elif result.stop_reason == "error":
             logger.error("LLM returned error: {}", (result.final_content or "")[:200])
-        return result.final_content, result.tools_used, result.messages, result.stop_reason, result.had_injections
+        return (
+            result.final_content,
+            result.tools_used,
+            result.messages,
+            result.stop_reason,
+            result.had_injections,
+        )
 
     async def run(self) -> None:
         """Run the agent loop, dispatching messages as tasks to stay responsive to /stop."""
@@ -485,10 +525,11 @@ class AgentLoop:
             task = asyncio.create_task(self._dispatch(msg))
             self._active_tasks.setdefault(effective_key, []).append(task)
             task.add_done_callback(
-                lambda t, k=effective_key: self._active_tasks.get(k, [])
-                and self._active_tasks[k].remove(t)
-                if t in self._active_tasks.get(k, [])
-                else None
+                lambda t, k=effective_key: (
+                    self._active_tasks.get(k, []) and self._active_tasks[k].remove(t)
+                    if t in self._active_tasks.get(k, [])
+                    else None
+                )
             )
 
     async def _dispatch(self, msg: InboundMessage) -> None:
@@ -520,11 +561,14 @@ class AgentLoop:
                             meta = dict(msg.metadata or {})
                             meta["_stream_delta"] = True
                             meta["_stream_id"] = _current_stream_id()
-                            await self.bus.publish_outbound(OutboundMessage(
-                                channel=msg.channel, chat_id=msg.chat_id,
-                                content=delta,
-                                metadata=meta,
-                            ))
+                            await self.bus.publish_outbound(
+                                OutboundMessage(
+                                    channel=msg.channel,
+                                    chat_id=msg.chat_id,
+                                    content=delta,
+                                    metadata=meta,
+                                )
+                            )
 
                         async def on_stream_end(*, resuming: bool = False) -> None:
                             nonlocal stream_segment
@@ -532,33 +576,45 @@ class AgentLoop:
                             meta["_stream_end"] = True
                             meta["_resuming"] = resuming
                             meta["_stream_id"] = _current_stream_id()
-                            await self.bus.publish_outbound(OutboundMessage(
-                                channel=msg.channel, chat_id=msg.chat_id,
-                                content="",
-                                metadata=meta,
-                            ))
+                            await self.bus.publish_outbound(
+                                OutboundMessage(
+                                    channel=msg.channel,
+                                    chat_id=msg.chat_id,
+                                    content="",
+                                    metadata=meta,
+                                )
+                            )
                             stream_segment += 1
 
                     response = await self._process_message(
-                        msg, on_stream=on_stream, on_stream_end=on_stream_end,
+                        msg,
+                        on_stream=on_stream,
+                        on_stream_end=on_stream_end,
                         pending_queue=pending,
                     )
                     if response is not None:
                         await self.bus.publish_outbound(response)
                     elif msg.channel == "cli":
-                        await self.bus.publish_outbound(OutboundMessage(
-                            channel=msg.channel, chat_id=msg.chat_id,
-                            content="", metadata=msg.metadata or {},
-                        ))
+                        await self.bus.publish_outbound(
+                            OutboundMessage(
+                                channel=msg.channel,
+                                chat_id=msg.chat_id,
+                                content="",
+                                metadata=msg.metadata or {},
+                            )
+                        )
                 except asyncio.CancelledError:
                     logger.info("Task cancelled for session {}", session_key)
                     raise
                 except Exception:
                     logger.exception("Error processing message for session {}", session_key)
-                    await self.bus.publish_outbound(OutboundMessage(
-                        channel=msg.channel, chat_id=msg.chat_id,
-                        content="Sorry, I encountered an error.",
-                    ))
+                    await self.bus.publish_outbound(
+                        OutboundMessage(
+                            channel=msg.channel,
+                            chat_id=msg.chat_id,
+                            content="Sorry, I encountered an error.",
+                        )
+                    )
         finally:
             # Drain any messages still in the pending queue and re-publish
             # them to the bus so they are processed as fresh inbound messages
@@ -576,7 +632,8 @@ class AgentLoop:
                 if leftover:
                     logger.info(
                         "Re-published {} leftover message(s) to bus for session {}",
-                        leftover, session_key,
+                        leftover,
+                        session_key,
                     )
 
     async def close_mcp(self) -> None:
@@ -634,12 +691,18 @@ class AgentLoop:
 
             messages = self.context.build_messages(
                 history=history,
-                current_message=msg.content, channel=channel, chat_id=chat_id,
+                current_message=msg.content,
+                channel=channel,
+                chat_id=chat_id,
                 session_summary=pending,
                 current_role=current_role,
+                python_namespace_description=self._python_namespace_description(),
             )
             final_content, _, all_msgs, _, _ = await self._run_agent_loop(
-                messages, session=session, channel=channel, chat_id=chat_id,
+                messages,
+                session=session,
+                channel=channel,
+                chat_id=chat_id,
                 message_id=msg.metadata.get("message_id"),
             )
             self._save_turn(session, all_msgs, 1 + len(history))
@@ -686,6 +749,7 @@ class AgentLoop:
             media=msg.media if msg.media else None,
             channel=msg.channel,
             chat_id=msg.chat_id,
+            python_namespace_description=self._python_namespace_description(),
         )
 
         async def _bus_progress(content: str, *, tool_hint: bool = False) -> None:
@@ -818,20 +882,22 @@ class AgentLoop:
                         continue
                     entry["content"] = filtered
             elif role == "user":
-                if isinstance(content, str) and content.startswith(ContextBuilder._RUNTIME_CONTEXT_TAG):
+                if isinstance(content, str) and content.startswith(
+                    ContextBuilder._RUNTIME_CONTEXT_TAG
+                ):
                     # Strip the entire runtime-context block (including any session summary).
                     # The block is bounded by _RUNTIME_CONTEXT_TAG and _RUNTIME_CONTEXT_END.
                     end_marker = ContextBuilder._RUNTIME_CONTEXT_END
                     end_pos = content.find(end_marker)
                     if end_pos >= 0:
-                        after = content[end_pos + len(end_marker):].lstrip("\n")
+                        after = content[end_pos + len(end_marker) :].lstrip("\n")
                         if after:
                             entry["content"] = after
                         else:
                             continue
                     else:
                         # Fallback: no end marker found, strip the tag prefix
-                        after_tag = content[len(ContextBuilder._RUNTIME_CONTEXT_TAG):].lstrip("\n")
+                        after_tag = content[len(ContextBuilder._RUNTIME_CONTEXT_TAG) :].lstrip("\n")
                         if after_tag.strip():
                             entry["content"] = after_tag
                         else:

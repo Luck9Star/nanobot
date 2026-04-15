@@ -1166,7 +1166,27 @@ class FeishuChannel(BaseChannel):
             logger.error("Error sending Feishu {} message: {}", msg_type, e)
             return None
 
-    def _create_streaming_card_sync(self, receive_id_type: str, chat_id: str) -> str | None:
+    def _send_or_reply_sync(
+        self,
+        receive_id_type: str,
+        receive_id: str,
+        msg_type: str,
+        content: str,
+        reply_message_id: str | None = None,
+    ) -> str | None:
+        """Reply to a message if reply_message_id is set, otherwise send normally."""
+        if reply_message_id:
+            ok = self._reply_message_sync(reply_message_id, msg_type, content)
+            if ok:
+                return reply_message_id
+        return self._send_message_sync(receive_id_type, receive_id, msg_type, content)
+
+    def _create_streaming_card_sync(
+        self,
+        receive_id_type: str,
+        chat_id: str,
+        reply_message_id: str | None = None,
+    ) -> str | None:
         """Create a CardKit streaming card, send it to chat, return card_id."""
         from lark_oapi.api.cardkit.v1 import CreateCardRequest, CreateCardRequestBody
 
@@ -1196,11 +1216,12 @@ class FeishuChannel(BaseChannel):
                 return None
             card_id = getattr(response.data, "card_id", None)
             if card_id:
-                message_id = self._send_message_sync(
+                message_id = self._send_or_reply_sync(
                     receive_id_type,
                     chat_id,
                     "interactive",
                     json.dumps({"type": "card", "data": {"card_id": card_id}}),
+                    reply_message_id=reply_message_id,
                 )
                 if message_id:
                     return card_id
@@ -1300,6 +1321,9 @@ class FeishuChannel(BaseChannel):
         loop = asyncio.get_running_loop()
         rid_type = "chat_id" if chat_id.startswith("oc_") else "open_id"
 
+        # Derive reply target for topic threads (keeps card replies in-thread)
+        _reply_id = meta.get("root_id") or meta.get("message_id") if meta.get("thread_id") else None
+
         # --- stream end: final update or fallback ---
         if meta.get("_stream_end"):
             if (message_id := meta.get("message_id")) and (reaction_id := meta.get("reaction_id")):
@@ -1336,15 +1360,19 @@ class FeishuChannel(BaseChannel):
                     "Streaming card {} final update failed, falling back to regular card",
                     buf.card_id,
                 )
-            for chunk in self._split_elements_by_table_limit(
-                self._build_card_elements(buf.text)
-            ):
+            for chunk in self._split_elements_by_table_limit(self._build_card_elements(buf.text)):
                 card = json.dumps(
                     {"config": {"wide_screen_mode": True}, "elements": chunk},
                     ensure_ascii=False,
                 )
                 await loop.run_in_executor(
-                    None, self._send_message_sync, rid_type, chat_id, "interactive", card
+                    None,
+                    self._send_or_reply_sync,
+                    rid_type,
+                    chat_id,
+                    "interactive",
+                    card,
+                    _reply_id,
                 )
             return
 
@@ -1360,7 +1388,7 @@ class FeishuChannel(BaseChannel):
         now = time.monotonic()
         if buf.card_id is None:
             card_id = await loop.run_in_executor(
-                None, self._create_streaming_card_sync, rid_type, chat_id
+                None, self._create_streaming_card_sync, rid_type, chat_id, _reply_id
             )
             if card_id:
                 buf.card_id = card_id
@@ -1405,13 +1433,24 @@ class FeishuChannel(BaseChannel):
                 # No active streaming card — send as a regular
                 # interactive card with the same 🔧 prefix style.
                 card = json.dumps(
-                    {"config": {"wide_screen_mode": True}, "elements": [
-                        {"tag": "markdown", "content": self._format_tool_hint_delta(hint)},
-                    ]},
+                    {
+                        "config": {"wide_screen_mode": True},
+                        "elements": [
+                            {"tag": "markdown", "content": self._format_tool_hint_delta(hint)},
+                        ],
+                    },
                     ensure_ascii=False,
                 )
                 await loop.run_in_executor(
-                    None, self._send_message_sync, receive_id_type, msg.chat_id, "interactive", card
+                    None,
+                    self._send_or_reply_sync,
+                    receive_id_type,
+                    msg.chat_id,
+                    "interactive",
+                    card,
+                    msg.metadata.get("root_id") or msg.metadata.get("message_id")
+                    if msg.metadata.get("thread_id")
+                    else None,
                 )
                 return
 
@@ -1422,7 +1461,8 @@ class FeishuChannel(BaseChannel):
             if self.config.reply_to_message and not msg.metadata.get("_progress", False):
                 reply_message_id = msg.metadata.get("message_id") or None
             # For topic group messages, always reply to keep context in thread
-            elif msg.metadata.get("thread_id"):
+            # thread_id (omt_xxx) identifies the topic; root_id (om_xxx) is for reply chains.
+            elif msg.metadata.get("thread_id") or msg.metadata.get("root_id"):
                 reply_message_id = (
                     msg.metadata.get("root_id") or msg.metadata.get("message_id") or None
                 )
@@ -1626,6 +1666,16 @@ class FeishuChannel(BaseChannel):
 
             # Forward to message bus
             reply_to = chat_id if chat_type == "group" else sender_id
+
+            # Isolate topic threads into separate sessions (mirrors Telegram pattern)
+            # thread_id (omt_xxx) is the topic identifier in 话题群 — always present;
+            # root_id (om_xxx) only exists in reply chains, None for the first message.
+            session_key_override = None
+            if thread_id:
+                session_key_override = f"feishu:{reply_to}:thread:{thread_id}"
+            elif root_id:
+                session_key_override = f"feishu:{reply_to}:thread:{root_id}"
+
             await self._handle_message(
                 sender_id=sender_id,
                 chat_id=reply_to,
@@ -1640,6 +1690,7 @@ class FeishuChannel(BaseChannel):
                     "root_id": root_id,
                     "thread_id": thread_id,
                 },
+                session_key=session_key_override,
             )
 
         except Exception as e:
@@ -1711,6 +1762,4 @@ class FeishuChannel(BaseChannel):
     def _format_tool_hint_delta(self, tool_hint: str) -> str:
         """Format a tool hint string with the 🔧 prefix for each line."""
         lines = self.__class__._format_tool_hint_lines(tool_hint).split("\n")
-        return "\n".join(
-            f"{self.config.tool_hint_prefix} {ln}" for ln in lines if ln.strip()
-        )
+        return "\n".join(f"{self.config.tool_hint_prefix} {ln}" for ln in lines if ln.strip())

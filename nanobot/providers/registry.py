@@ -82,7 +82,6 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         backend="openai_compat",
         is_direct=True,
     ),
-
     # === Azure OpenAI (direct API calls with API version 2024-10-21) =====
     ProviderSpec(
         name="azure_openai",
@@ -132,7 +131,6 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         detect_by_base_keyword="siliconflow",
         default_api_base="https://api.siliconflow.cn/v1",
     ),
-
     # VolcEngine (火山引擎): OpenAI-compatible gateway, pay-per-use models
     ProviderSpec(
         name="volcengine",
@@ -144,7 +142,6 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         detect_by_base_keyword="volces",
         default_api_base="https://ark.cn-beijing.volces.com/api/v3",
     ),
-
     # VolcEngine Coding Plan (火山引擎 Coding Plan): same key as volcengine
     ProviderSpec(
         name="volcengine_coding_plan",
@@ -156,7 +153,6 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         default_api_base="https://ark.cn-beijing.volces.com/api/coding/v3",
         strip_model_prefix=True,
     ),
-
     # BytePlus: VolcEngine international, pay-per-use models
     ProviderSpec(
         name="byteplus",
@@ -169,7 +165,6 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         default_api_base="https://ark.ap-southeast.bytepluses.com/api/v3",
         strip_model_prefix=True,
     ),
-
     # BytePlus Coding Plan: same key as byteplus
     ProviderSpec(
         name="byteplus_coding_plan",
@@ -181,8 +176,6 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         default_api_base="https://ark.ap-southeast.bytepluses.com/api/coding/v3",
         strip_model_prefix=True,
     ),
-
-
     # === Standard providers (matched by model-name keywords) ===============
     # Anthropic: native Anthropic SDK
     ProviderSpec(
@@ -356,7 +349,7 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         env_key="QIANFAN_API_KEY",
         display_name="Qianfan",
         backend="openai_compat",
-        default_api_base="https://qianfan.baidubce.com/v2"
+        default_api_base="https://qianfan.baidubce.com/v2",
     ),
 )
 
@@ -373,3 +366,60 @@ def find_by_name(name: str) -> ProviderSpec | None:
         if spec.name == normalized:
             return spec
     return None
+
+
+def make_provider_for_model(config, model: str):
+    """Create the appropriate LLM provider for a specific model name.
+
+    Routing is driven by ``ProviderSpec.backend`` in the registry.
+    """
+    from nanobot.providers.base import GenerationSettings
+
+    provider_name = config.get_provider_name(model)
+    p = config.get_provider(model)
+    spec = find_by_name(provider_name) if provider_name else None
+    backend = spec.backend if spec else "openai_compat"
+
+    if backend == "openai_codex":
+        from nanobot.providers.openai_codex_provider import OpenAICodexProvider
+
+        provider = OpenAICodexProvider(default_model=model)
+    elif backend == "azure_openai":
+        from nanobot.providers.azure_openai_provider import AzureOpenAIProvider
+
+        provider = AzureOpenAIProvider(
+            api_key=p.api_key if p else None,
+            api_base=p.api_base if p else None,
+            default_model=model,
+        )
+    elif backend == "github_copilot":
+        from nanobot.providers.github_copilot_provider import GitHubCopilotProvider
+
+        provider = GitHubCopilotProvider(default_model=model)
+    elif backend == "anthropic":
+        from nanobot.providers.anthropic_provider import AnthropicProvider
+
+        provider = AnthropicProvider(
+            api_key=p.api_key if p else None,
+            api_base=config.get_api_base(model),
+            default_model=model,
+            extra_headers=p.extra_headers if p else None,
+        )
+    else:
+        from nanobot.providers.openai_compat_provider import OpenAICompatProvider
+
+        provider = OpenAICompatProvider(
+            api_key=p.api_key if p else None,
+            api_base=config.get_api_base(model),
+            default_model=model,
+            extra_headers=p.extra_headers if p else None,
+            spec=spec,
+        )
+
+    defaults = config.agents.defaults
+    provider.generation = GenerationSettings(
+        temperature=defaults.temperature,
+        max_tokens=defaults.max_tokens,
+        reasoning_effort=defaults.reasoning_effort,
+    )
+    return provider

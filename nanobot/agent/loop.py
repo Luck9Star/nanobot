@@ -24,11 +24,16 @@ from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
 from nanobot.agent.tools.message import MessageTool
 from nanobot.agent.tools.notebook import NotebookEditTool
+from nanobot.agent.tools.python_runtime import (
+    PythonDescribeTool,
+    PythonExecuteTool,
+    PythonResetTool,
+    PythonRuntimeManager,
+)
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.search import GlobTool, GrepTool
 from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.spawn import SpawnTool
-from nanobot.agent.tools.python_runtime import PythonRuntimeTool
 from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
@@ -163,6 +168,7 @@ class AgentLoop:
         hooks: list[AgentHook] | None = None,
         unified_session: bool = False,
         disabled_skills: list[str] | None = None,
+        config_path: Path | None = None,
     ):
         from nanobot.config.schema import ExecToolConfig, PythonRuntimeConfig, WebToolsConfig
 
@@ -172,6 +178,7 @@ class AgentLoop:
         self.provider = provider
         self.workspace = workspace
         self.model = model or provider.get_default_model()
+        self._config_path = config_path
         self.max_iterations = (
             max_iterations if max_iterations is not None else defaults.max_tool_iterations
         )
@@ -190,7 +197,7 @@ class AgentLoop:
         self.web_config = web_config or WebToolsConfig()
         self.exec_config = exec_config or ExecToolConfig()
         self.python_runtime_config = python_runtime_config or PythonRuntimeConfig()
-        self._python_runtime_tool: PythonRuntimeTool | None = None
+        self._python_runtime_manager: PythonRuntimeManager | None = None
         self.cron_service = cron_service
         self.restrict_to_workspace = restrict_to_workspace
         self._start_time = time.time()
@@ -254,6 +261,36 @@ class AgentLoop:
         self.commands = CommandRouter()
         register_builtin_commands(self.commands)
 
+    def set_model(self, model: str) -> None:
+        """Switch the active model at runtime, rebuilding the provider if needed."""
+        if self._config_path:
+            from nanobot.config.loader import load_config, resolve_config_env_vars
+            from nanobot.providers.registry import find_by_name, make_provider_for_model
+
+            config = resolve_config_env_vars(load_config(self._config_path))
+            provider_name = config.get_provider_name(model)
+            spec = find_by_name(provider_name) if provider_name else None
+            backend = spec.backend if spec else "openai_compat"
+            p = config.get_provider(model)
+            needs_key = not (p and p.api_key)
+            exempt = spec and (spec.is_oauth or spec.is_local or spec.is_direct)
+            if needs_key and not exempt and backend != "anthropic":
+                raise ValueError(f"No API key configured for model '{model}'")
+
+            new_provider = make_provider_for_model(config, model)
+        else:
+            new_provider = self.provider
+
+        new_runner = AgentRunner(new_provider)
+
+        self.model = model
+        self.provider = new_provider
+        self.runner = new_runner
+
+        self.subagents.set_model(model, new_provider)
+        self.consolidator.set_model(model, new_provider)
+        self.dream.set_model(model, new_provider)
+
     def _register_default_tools(self) -> None:
         """Register the default set of tools."""
         allowed_dir = (
@@ -294,19 +331,21 @@ class AgentLoop:
             )
         if self.python_runtime_config.enable:
             try:
-                python_tool = PythonRuntimeTool(
+                manager = PythonRuntimeManager(
                     backend=self.python_runtime_config.backend,
                     max_output_chars=self.python_runtime_config.max_output_chars,
                     security_config=self.python_runtime_config.security,
                 )
-                self.tools.register(python_tool)
-                self._python_runtime_tool = python_tool
+                self.tools.register(PythonExecuteTool(manager=manager))
+                self.tools.register(PythonResetTool(manager=manager))
+                self.tools.register(PythonDescribeTool(manager=manager))
+                self._python_runtime_manager = manager
                 logger.info(
-                    "PythonRuntimeTool registered (backend={})", self.python_runtime_config.backend
+                    "PythonRuntimeTools registered (backend={})", self.python_runtime_config.backend
                 )
             except ImportError:
                 logger.warning(
-                    "PythonRuntimeTool enabled but cave-agent not installed. "
+                    "PythonRuntimeTools enabled but cave-agent not installed. "
                     "Install with: pip install 'cave-agent[all]'"
                 )
 
@@ -341,9 +380,9 @@ class AgentLoop:
 
     def _python_namespace_description(self) -> str | None:
         """Return the Python runtime namespace description for system prompt injection."""
-        if self._python_runtime_tool is None:
+        if self._python_runtime_manager is None:
             return None
-        desc = self._python_runtime_tool.describe_namespace()
+        desc = self._python_runtime_manager.describe_namespace()
         return desc if desc and desc != "Empty namespace" else None
 
     @staticmethod
@@ -642,12 +681,12 @@ class AgentLoop:
                     )
 
     async def close_runtime(self) -> None:
-        if self._python_runtime_tool is not None:
+        if self._python_runtime_manager is not None:
             try:
-                await self._python_runtime_tool.cleanup()
+                await self._python_runtime_manager.cleanup()
             except Exception:
                 logger.warning("PythonRuntime cleanup error (can be ignored)")
-            self._python_runtime_tool = None
+            self._python_runtime_manager = None
 
     async def close_mcp(self) -> None:
         """Drain pending background archives, then close MCP connections."""
@@ -1046,8 +1085,11 @@ class AgentLoop:
         """Process a message directly and return the outbound payload."""
         await self._connect_mcp()
         msg = InboundMessage(
-            channel=channel, sender_id="user", chat_id=chat_id,
-            content=content, media=media or [],
+            channel=channel,
+            sender_id="user",
+            chat_id=chat_id,
+            content=content,
+            media=media or [],
         )
         return await self._process_message(
             msg,

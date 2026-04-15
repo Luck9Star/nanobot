@@ -404,12 +404,8 @@ def _onboard_plugins(config_path: Path) -> None:
 
 
 def _make_provider(config: Config):
-    """Create the appropriate LLM provider from config.
-
-    Routing is driven by ``ProviderSpec.backend`` in the registry.
-    """
-    from nanobot.providers.base import GenerationSettings
-    from nanobot.providers.registry import find_by_name
+    """Create the appropriate LLM provider from config (startup-time)."""
+    from nanobot.providers.registry import find_by_name, make_provider_for_model
 
     model = config.agents.defaults.model
     provider_name = config.get_provider_name(model)
@@ -417,7 +413,6 @@ def _make_provider(config: Config):
     spec = find_by_name(provider_name) if provider_name else None
     backend = spec.backend if spec else "openai_compat"
 
-    # --- validation ---
     if backend == "azure_openai":
         if not p or not p.api_key or not p.api_base:
             console.print("[red]Error: Azure OpenAI requires api_key and api_base.[/red]")
@@ -432,50 +427,7 @@ def _make_provider(config: Config):
             console.print("Set one in ~/.nanobot/config.json under providers section")
             raise typer.Exit(1)
 
-    # --- instantiation by backend ---
-    if backend == "openai_codex":
-        from nanobot.providers.openai_codex_provider import OpenAICodexProvider
-
-        provider = OpenAICodexProvider(default_model=model)
-    elif backend == "azure_openai":
-        from nanobot.providers.azure_openai_provider import AzureOpenAIProvider
-
-        provider = AzureOpenAIProvider(
-            api_key=p.api_key,
-            api_base=p.api_base,
-            default_model=model,
-        )
-    elif backend == "github_copilot":
-        from nanobot.providers.github_copilot_provider import GitHubCopilotProvider
-
-        provider = GitHubCopilotProvider(default_model=model)
-    elif backend == "anthropic":
-        from nanobot.providers.anthropic_provider import AnthropicProvider
-
-        provider = AnthropicProvider(
-            api_key=p.api_key if p else None,
-            api_base=config.get_api_base(model),
-            default_model=model,
-            extra_headers=p.extra_headers if p else None,
-        )
-    else:
-        from nanobot.providers.openai_compat_provider import OpenAICompatProvider
-
-        provider = OpenAICompatProvider(
-            api_key=p.api_key if p else None,
-            api_base=config.get_api_base(model),
-            default_model=model,
-            extra_headers=p.extra_headers if p else None,
-            spec=spec,
-        )
-
-    defaults = config.agents.defaults
-    provider.generation = GenerationSettings(
-        temperature=defaults.temperature,
-        max_tokens=defaults.max_tokens,
-        reasoning_effort=defaults.reasoning_effort,
-    )
-    return provider
+    return make_provider_for_model(config, model)
 
 
 def _load_runtime_config(config: str | None = None, workspace: str | None = None) -> Config:
@@ -576,6 +528,8 @@ def serve(
     bus = MessageBus()
     provider = _make_provider(runtime_config)
     session_manager = SessionManager(runtime_config.workspace_path)
+    from nanobot.config.loader import get_config_path
+
     agent_loop = AgentLoop(
         bus=bus,
         provider=provider,
@@ -597,6 +551,7 @@ def serve(
         unified_session=runtime_config.agents.defaults.unified_session,
         disabled_skills=runtime_config.agents.defaults.disabled_skills,
         session_ttl_minutes=runtime_config.agents.defaults.session_ttl_minutes,
+        config_path=get_config_path(),
     )
 
     model_name = runtime_config.agents.defaults.model
@@ -669,6 +624,8 @@ def gateway(
     cron_store_path = config.workspace_path / "cron" / "jobs.json"
     cron = CronService(cron_store_path)
 
+    from nanobot.config.loader import get_config_path
+
     # Create agent with cron service
     agent = AgentLoop(
         bus=bus,
@@ -692,6 +649,7 @@ def gateway(
         unified_session=config.agents.defaults.unified_session,
         disabled_skills=config.agents.defaults.disabled_skills,
         session_ttl_minutes=config.agents.defaults.session_ttl_minutes,
+        config_path=get_config_path(),
     )
 
     # Set cron callback (needs agent)
@@ -966,6 +924,8 @@ def agent(
     else:
         logger.disable("nanobot")
 
+    from nanobot.config.loader import get_config_path
+
     agent_loop = AgentLoop(
         bus=bus,
         provider=provider,
@@ -987,6 +947,7 @@ def agent(
         unified_session=config.agents.defaults.unified_session,
         disabled_skills=config.agents.defaults.disabled_skills,
         session_ttl_minutes=config.agents.defaults.session_ttl_minutes,
+        config_path=get_config_path(),
     )
     restart_notice = consume_restart_notice_from_env()
     if restart_notice and should_show_cli_restart_notice(restart_notice, session_id):
